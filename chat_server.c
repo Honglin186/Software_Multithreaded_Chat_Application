@@ -8,7 +8,7 @@
 
 typedef struct Client {
     struct sockaddr_in address;
-    char name[32];
+    char name[BUFFER_SIZE];
     struct Client *next;
 } Client;
 
@@ -21,21 +21,150 @@ typedef struct Request {
 Client *clients = NULL;
 pthread_rwlock_t clients_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-void connect_client(void *arg){
-    Request *cr = (Request *) arg;
-    pthread_rwlock_wrlock(&clients_lock);
+void reply_client(Request *cr, char *message){
+    udp_socket_write(cr->sd, &cr->sender, message, strlen(message) + 1);
+}
 
+Client *find_client(struct sockaddr_in *address){
+    Client *c = clients;
+
+    while(c != NULL){
+        if(c->address.sin_addr.s_addr == address->sin_addr.s_addr && c->address.sin_port == address->sin_port){
+            return c;
+        }
+        c = c->next;
+    }
+
+    return NULL;
+}
+
+Client *find_client_by_name(char *name){
+    Client *c = clients;
+    while(c != NULL){
+        if(strcmp(c->name, name) == 0){
+            return c;
+        }
+        c = c->next;
+    }
+    return NULL;
+}
+
+void connect_client(void *arg){
+    char message[BUFFER_SIZE];
+    Request *cr = (Request *) arg;
+
+    pthread_rwlock_wrlock(&clients_lock);
     Client *c = calloc(1, sizeof(*c));
     c->address = cr->sender;
     strcpy(c->name, cr->text);
     c->next = clients;
     clients = c;
+    pthread_rwlock_unlock(&clients_lock);
+
+    snprintf(message, sizeof(message), "Hi %s, you have successfully connected to the chat\n", cr->text);
+    reply_client(cr, "you have successfully connected to the chat");
+}
+
+void say_client(void *arg){
+    Request *cr = (Request *) arg;
+
+    pthread_rwlock_rdlock(&clients_lock);
+    Client *c = find_client(&cr->sender);
+
+    if(c != NULL){
+        Client *clients_list = clients;
+        char message[BUFFER_SIZE];
+        snprintf(message, sizeof(message), "%s: %s\n", c->name, cr->text);
+        while(clients_list != NULL){
+            udp_socket_write(cr->sd, &clients_list->address ,message, strlen(message) + 1);
+            clients_list = clients_list->next;
+        }
+    }
 
     pthread_rwlock_unlock(&clients_lock);
 }
 
+void sayto_client(void *arg){
+    Request *cr = (Request *) arg;
 
+    pthread_rwlock_rdlock(&clients_lock);
+    char target_client[BUFFER_SIZE], message[BUFFER_SIZE];
+    char *p = strchr(cr->text, ' ');
+    Client *c_sender = find_client(&cr->sender);
 
+    if(p != NULL){
+        size_t len_c = p - cr->text;
+        char *start_point_r = p + 1;
+        while(isspace((unsigned char)*start_point_r)){
+            start_point_r++;
+        }
+        memcpy(target_client, cr->text, len_c);
+        target_client[len_c] = '\0';
+
+        Client *c_target = find_client_by_name(target_client);
+        snprintf(message, sizeof(message), "%s: %s\n", c_sender->name, start_point_r);
+        udp_socket_write(cr->sd, &c_target->address ,message, strlen(message) + 1);
+    }
+    pthread_rwlock_unlock(&clients_lock);
+}
+
+void disconn_client(void *arg){
+    Request *cr = (Request *) arg;
+
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *c = find_client(&cr->sender);
+    if(c == NULL){
+        pthread_rwlock_unlock(&clients_lock);
+        return;
+    }
+    
+    Client *c_list = clients;
+    Client *previous = NULL;
+    while(c_list != NULL){
+        if(c_list == c){
+            if(previous == NULL){
+                clients = c_list->next;
+            }
+            else{
+                previous->next = c_list->next;
+            }
+
+            free(c_list);
+            break;
+        }
+        previous = c_list;
+        c_list = c_list->next;
+    }
+    pthread_rwlock_unlock(&clients_lock);
+
+    reply_client(cr, "Disconnected. Bye!");
+}
+
+void rename_client(void *arg){
+    Request *cr = (Request *) arg;
+    char message[BUFFER_SIZE];
+
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *c = find_client(&cr->sender);
+    strcpy(c->name,cr->text);
+    pthread_rwlock_unlock(&clients_lock);
+
+    snprintf(message, sizeof(message), "You are now known as %s.\n", cr->text);
+    reply_client(cr,message);
+}
+
+void mute_client(void *arg){
+    Request *cr = (Request *) arg;
+
+}
+
+void unmute_client(void *arg){
+    Request *cr = (Request *) arg;
+}
+
+void kick_client(void *arg){
+    Request *cr = (Request *) arg;
+}
 
 
 
@@ -55,7 +184,7 @@ void *worker_thread(void *arg){
         memcpy(client_command, cr->text, len_c);
         client_command[len_c] = '\0';
 
-        memcpy(client_request, p + 1, strlen(start_point_r) + 1);
+        memcpy(client_request, start_point_r, strlen(start_point_r) + 1);
     }
     else{
         free(cr);
@@ -66,8 +195,35 @@ void *worker_thread(void *arg){
         strcpy(cr->text, client_request);
         connect_client(cr);
     }
+    else if(strcmp(client_command, "say") == 0){
+        strcpy(cr->text, client_request);
+        say_client(cr);
+    }
+    else if(strcmp(client_command, "sayto") == 0){
+        strcpy(cr->text, client_request);
+        sayto_client(cr);
+    }
+    else if(strcmp(client_command, "disconn") == 0){
+        strcpy(cr->text, client_request);
+        disconn_client(cr);
+    }
+    else if(strcmp(client_command, "mute") == 0){
+        strcpy(cr->text, client_request);
+        mute_client(cr);
+    }
+    else if(strcmp(client_command, "unmute") == 0){
+        strcpy(cr->text, client_request);
+        unmute_client(cr);
+    }
+    else if(strcmp(client_command, "rename") == 0){
+        strcpy(cr->text, client_request);
+        rename_client(cr);
+    }
+    else if(strcmp(client_command, "kick") == 0){
+        strcpy(cr->text, client_request);
+        kick_client(cr);
+    }
 
-    printf("Hi %s, you have successfully connected to the chat \n",clients->name);
 
     free(cr);
     return NULL;
