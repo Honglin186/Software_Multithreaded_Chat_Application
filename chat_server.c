@@ -46,12 +46,30 @@ char history[HISTORY_SIZE][BUFFER_SIZE];
 int history_next = 0;
 int history_count = 0;
 
+unsigned long next_client_id = 0;
+
 pthread_rwlock_t clients_lock = PTHREAD_RWLOCK_INITIALIZER;
-pthread_mutex_t history_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_rwlock_t history_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 void reply_client(Request *cr, char *message){
     udp_socket_write(cr->sd, &cr->sender, message, strlen(message) + 1);
+}
+
+time_t current_time(void){
+    struct timespec ts;
+    if(clock_gettime(CLOCK_MONOTONIC, &ts) != 0){
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+    return ts.tv_sec;
+}
+
+time_t last_activity_time(Client *c){
+    if(c->waiting_ping){
+        return c->ping_sent_time;
+    }
+    return c->last_active_time;
 }
 
 Client *find_client(struct sockaddr_in *address){
@@ -146,6 +164,13 @@ void remove_client(Client *target){
             else{
                 remove_activity(&active_clients, c);
             }
+
+            MutedClient *m = c->muted_clients;
+            while(m != NULL){
+                MutedClient *next_m = m->next;
+                free(m);
+                m = next_m;
+            }
             free(c);
             return;
         }
@@ -155,38 +180,34 @@ void remove_client(Client *target){
 }
 
 void add_history(char *message){
-    pthread_mutex_lock(&history_lock);
+    pthread_rwlock_rdlock(&history_lock);
     snprintf(history[history_next], BUFFER_SIZE, "%s", message);
     history_next = (history_next + 1) % HISTORY_SIZE;
     if(history_count < HISTORY_SIZE){
         history_count++;
     }
-    pthread_mutex_unlock(&history_lock);
-}
-
-time_t current_time(void){
-    struct timespec ts;
-    if(clock_gettime(CLOCK_MONOTONIC, &ts) != 0){
-        perror("clock_gettime");
-        exit(EXIT_FAILURE);
-    }
-    return ts.tv_sec;
-}
-
-time_t last_activity_time(Client *c){
-    if(c->waiting_ping){
-        return c->ping_sent_time;
-    }
-    return c->last_active_time;
+    pthread_rwlock_unlock(&history_lock);
 }
 
 void record_activity(Request *cr){
     pthread_rwlock_wrlock(&clients_lock);
     Client *c = find_client(&cr->sender);
+
+    if(c == NULL){
+        pthread_rwlock_unlock(&clients_lock);
+        return;
+    }
     
-    remove_activity(&active_clients, c);
-    c->last_active_time = current_time();
-    insert_activity(&active_clients, c);
+    if(c->waiting_ping == 1){
+        remove_activity(&waiting_clients, c);
+        c->last_active_time = current_time();
+        insert_activity(&waiting_clients, c);
+    }
+    else{
+        remove_activity(&active_clients, c);
+        c->last_active_time = current_time();
+        insert_activity(&active_clients, c);
+    }
     pthread_rwlock_unlock(&clients_lock);
 }
 
@@ -209,13 +230,25 @@ void connect_client(void *arg){
     Request *cr = (Request *) arg;
 
     pthread_rwlock_wrlock(&clients_lock);
+    if(find_client(&cr->sender) != NULL){
+        pthread_rwlock_unlock(&clients_lock);
+        reply_client(cr, "You are already connected.");
+        return;
+    }
+    if(find_client_by_name(cr->text) != NULL){
+        pthread_rwlock_unlock(&clients_lock);
+        reply_client(cr, "Username already exists.");
+        return;
+    }
+
     Client *c = calloc(1, sizeof(*c));
-    if (clients == NULL){
-        c->id = 0;
+    if(c == NULL){
+        pthread_rwlock_unlock(&clients_lock);
+        perror("calloc");
+        return;
     }
-    else{
-        c->id = clients->id + 1;
-    }
+    c->id = next_client_id;
+    next_client_id ++;
     c->muted_clients = NULL;
     c->address = cr->sender;
     strcpy(c->name, cr->text);
@@ -231,12 +264,12 @@ void connect_client(void *arg){
     pthread_rwlock_unlock(&clients_lock);
 
     snprintf(message, sizeof(message), "Hi %s, you have successfully connected to the chat\n", cr->text);
-    reply_client(cr, "you have successfully connected to the chat");
+    reply_client(cr, message);
     reply_client(cr, "This is chat history.");
 
     pthread_rwlock_rdlock(&history_lock);
     if(history_count < HISTORY_SIZE){
-        for(int i; i<history_count; i++){
+        for(int i=0; i<history_count; i++){
             reply_client(cr,history[i]);
         }
     }
@@ -371,13 +404,13 @@ void kick_client(void *arg){
 
     pthread_rwlock_wrlock(&clients_lock);
     Client *target = find_client_by_name(cr->text);
-    Client *c_list = clients;
     char message_to_target[BUFFER_SIZE], broadcast_message[BUFFER_SIZE];
     snprintf(message_to_target, sizeof(message_to_target), "You have been removed from the chat.\n");
     snprintf(broadcast_message, sizeof(broadcast_message), "%s has been removed from the chat.\n", target->name);
 
     udp_socket_write(cr->sd, &target->address ,message_to_target, strlen(message_to_target) + 1);
     remove_client(target);
+    Client *c_list = clients;
     
     while(c_list != NULL){
         udp_socket_write(cr->sd, &c_list->address ,broadcast_message, strlen(broadcast_message) + 1);
@@ -510,7 +543,7 @@ void *listener_thread(void *arg){
         client_requests->text[rc] = '\0';
 
         client_requests->text[strcspn(client_requests->text, "\r\n")] = '\0';
-        if(client_requests->text == "ret-ping$"){
+        if(strcmp(client_requests->text, "ret-ping$") == 0){
             refresh_activity(client_requests);
             free(client_requests);
             continue;
