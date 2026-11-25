@@ -1,10 +1,10 @@
 # ELEC50014 Assignment 2 — Multithreaded Chat Application
 
-This C server uses UDP and POSIX threads to let clients register, exchange messages, change names, and leave the chat. On 24 November, those five commands passed a three-client test in Honglin's development copy. The team repository at `588bda7` contains the earlier registration milestone. [Assignment brief](https://sarimbaig01.github.io/elec50014/Docs/Assignment2.html)
+This C chat application uses IPv4 UDP and POSIX threads. The server in team commit `fba9b8d` builds and supports registration, broadcast, private messaging, rename, and disconnect for registered users. Honglin's 25 November development copy adds moderation, connection history, and an inactivity monitor. Its clean build currently fails because `remove_activity` is called before its declaration. The results below identify which features have been exercised end to end and which were checked in isolation. [Assignment brief](https://sarimbaig01.github.io/elec50014/Docs/Assignment2.html)
 
 ## Build and run
 
-From the directory containing the C sources, compile both programs and start the server.
+From the repository directory, compile the checked-in version and start the server.
 
 ```sh
 cc -Wall -pthread chat_server.c -o chat_server
@@ -12,7 +12,7 @@ cc -Wall chat_client.c -o chat_client
 ./chat_server
 ```
 
-In a second terminal in the same directory, run `./chat_client`. This single-request test client binds to port `10000` and sends `conn$ Alice` to `127.0.0.1:12000`. With the development server, the client prints `server_response: you have successfully connected to the chat` and exits. With the repository version at `588bda7`, the greeting appears in the server terminal and the client waits for a reply. Use Ctrl-C to stop a waiting process. The messaging tests below used three separate UDP endpoints.
+In a second terminal in the same directory, run `./chat_client`. The test client sends `conn$ Alice` from UDP port `10000` to `127.0.0.1:12000`, prints `server_response: you have successfully connected to the chat`, and exits. Use Ctrl-C in the server terminal to stop it. The client currently sends this one fixed request. The multi-client tests used separate UDP endpoints.
 
 ## Implementation
 
@@ -46,13 +46,26 @@ The following results come from a loopback test on 24 November using the develop
 | Alice sent `rename$ Alicia` | Alice received confirmation. Eve could address a private message to Alicia, and Alicia's next broadcast showed the new name. |
 | Bob sent `disconn$` | Bob received `Disconnected. Bye!`. Eve's next broadcast reached Eve and Alicia only. Follow-up broadcasts also succeeded after removing the tail and head of the list. |
 
-**Known limitations.** The server accepted both a new registration and a rename using a name already in use. This makes private-message routing ambiguous. The private-message handler must also check that both clients exist, and rename must check that the sender is registered. Public and private sends currently hold the registry read lock during socket writes, which can delay membership changes.
+### 5. Moderation, history, and inactivity
 
-## Work distribution and next steps
+The 25 November development snapshot (`f025ab507577`) contains handlers for all eight user commands. Since that snapshot does not compile on its own, the reviewer used a temporary harness that supplied the missing function declaration, seeded registered clients, and captured outgoing messages. These checks exercised individual code paths without a running chat client.
 
-| Team member | Work so far and agreed responsibilities |
+| Feature | Design and observed result | Remaining work |
+|---|---|---|
+| `mute$` and `unmute$` | Each recipient keeps a linked list of muted session IDs. Alice continued to filter Bob's broadcasts after his rename, while Eve received them. Unmuting restored Alice's delivery. | Private delivery must check the recipient's mute list. Repeated mutes and client removal also need to clean up mute entries and prevent a new session from inheriting a reused ID. |
+| Admin `kick$` | The handler checks source port `6666`. An ordinary endpoint received `No Permission.`. For an admin kick of a non-head client, the target received a removal notice and each remaining endpoint received the announcement. | Removing the list head invalidates the saved broadcast cursor. Begin traversal from the updated head and handle a missing target before using its address. |
+| **Part 3. History on connection** | Public broadcasts enter a 15-slot circular buffer. With 17 numbered broadcasts and a private message, the stored history contained exactly broadcasts 3–17 in order. | Replay uses reader–writer lock functions on a mutex and leaves the partial-history loop counter uninitialised. Fix both and coordinate the history snapshot with registration so a concurrent broadcast is delivered once. |
+| **Part 4. Remove inactive clients** | Two timestamp-ordered linked lists track active clients and outstanding pings using a monotonic clock. The idle threshold is 300 seconds and the reply window is 10 seconds. Two pre-aged test clients were pinged. Calling the refresh helper directly kept one active, and the monitor removed the silent one after the grace period. | The listener updates activity before first registration and compares the ping reply by pointer. Guard session lookups, recognise `ret-ping$` by its contents, and keep each client in exactly one activity list. The interactive client still needs automatic replies. |
+
+### Next integration check
+
+First restore a clean build. Then use real client endpoints to check that a newcomer receives exactly messages 3–17, that mute applies to private messages, that an admin can kick the most recently joined client, and that a quiet client replying to pings stays while a silent client is removed. Registration and rename also need unique-name checks, and handlers must handle missing clients safely.
+
+## Work distribution
+
+| Team member | Contribution and responsibilities |
 |---|---|
-| Honglin | Implemented the threaded server and the five commands tested above. Owns server validation, the moderation commands, connection history, and inactive-client removal. |
-| Nicky | Assigned the interactive client, automatic ping replies, and multi-client integration tests. These deliverables are pending. |
+| Honglin | Implemented the threaded server and command handlers. Added public history, the activity lists, and the ping monitor in the development copy. Owns the remaining server fixes and integration. |
+| Nicky | Assigned the interactive client, automatic ping replies, and team multi-client integration tests. The checked-in client is the single-request test program. |
 
-The next server steps are to enforce unique names, handle missing clients, and implement `mute$`, `unmute$`, and admin-only `kick$`. Connection history and inactivity monitoring are planned core features. Stretch-feature selection is deferred until core integration.
+History and inactivity are core assignment requirements. The team will choose a stretch feature after core client/server integration.

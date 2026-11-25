@@ -3,12 +3,30 @@
 #include "udp.h"
 #include <pthread.h>
 #include <ctype.h>
+#include <time.h>
+
+#define HISTORY_SIZE 15
+#define INACTIVE_TIME 300
+#define PING_TIMEOUT 10
 
 
+
+typedef struct MutedClient {
+    unsigned long id;
+    struct MutedClient *next;
+} MutedClient;
 
 typedef struct Client {
     struct sockaddr_in address;
     char name[BUFFER_SIZE];
+
+    unsigned long id;
+    MutedClient *muted_clients;
+    time_t last_active_time;
+    time_t ping_sent_time;
+    int waiting_ping;
+
+    struct Client *activity_next;
     struct Client *next;
 } Client;
 
@@ -18,8 +36,19 @@ typedef struct Request {
     int sd;
 } Request;
 
+
+
 Client *clients = NULL;
+Client *active_clients = NULL;
+Client *waiting_clients = NULL;
+
+char history[HISTORY_SIZE][BUFFER_SIZE];
+int history_next = 0;
+int history_count = 0;
+
 pthread_rwlock_t clients_lock = PTHREAD_RWLOCK_INITIALIZER;
+pthread_mutex_t history_lock = PTHREAD_MUTEX_INITIALIZER;
+
 
 void reply_client(Request *cr, char *message){
     udp_socket_write(cr->sd, &cr->sender, message, strlen(message) + 1);
@@ -49,20 +78,176 @@ Client *find_client_by_name(char *name){
     return NULL;
 }
 
+int check_if_muted(MutedClient *m, unsigned long sender_id){
+    while(m != NULL){
+        if (m->id == sender_id){
+            return 1;
+        }
+        m = m->next;
+    }
+    return 0;
+}
+
+void insert_activity(Client **head, Client *target){
+    Client *c = *head;
+    Client *previous = NULL;
+
+    while(c != NULL && last_activity_time(c) <= last_activity_time(target)){
+        previous = c;
+        c = c->activity_next;
+    }
+    target->activity_next = c;
+
+    if(previous == NULL){
+        *head = target;
+    }
+    else{
+        previous->activity_next = target;
+    }
+}
+
+void remove_activity(Client **head, Client *target){
+    Client *c = *head;
+    Client *previous = NULL;
+
+    while(c != NULL){
+        if(c == target){
+            if(previous == NULL){
+                *head = c->activity_next;
+            }
+            else{
+                previous->activity_next = c->activity_next;
+            }
+
+            c->activity_next = NULL;
+            return;
+        }
+        previous = c;
+        c = c->activity_next;
+    }
+}
+
+void remove_client(Client *target){
+    Client *c = clients;
+    Client *previous = NULL;
+
+    while(c != NULL){
+        if(c == target){
+            if(previous == NULL){
+                clients = c->next;
+            }
+            else{
+                previous->next = c->next;
+            }
+
+            if(target->waiting_ping == 1){
+                remove_activity(&waiting_clients, c);
+            }
+            else{
+                remove_activity(&active_clients, c);
+            }
+            free(c);
+            return;
+        }
+        previous = c;
+        c = c->next;
+    }
+}
+
+void add_history(char *message){
+    pthread_mutex_lock(&history_lock);
+    snprintf(history[history_next], BUFFER_SIZE, "%s", message);
+    history_next = (history_next + 1) % HISTORY_SIZE;
+    if(history_count < HISTORY_SIZE){
+        history_count++;
+    }
+    pthread_mutex_unlock(&history_lock);
+}
+
+time_t current_time(void){
+    struct timespec ts;
+    if(clock_gettime(CLOCK_MONOTONIC, &ts) != 0){
+        perror("clock_gettime");
+        exit(EXIT_FAILURE);
+    }
+    return ts.tv_sec;
+}
+
+time_t last_activity_time(Client *c){
+    if(c->waiting_ping){
+        return c->ping_sent_time;
+    }
+    return c->last_active_time;
+}
+
+void record_activity(Request *cr){
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *c = find_client(&cr->sender);
+    
+    remove_activity(&active_clients, c);
+    c->last_active_time = current_time();
+    insert_activity(&active_clients, c);
+    pthread_rwlock_unlock(&clients_lock);
+}
+
+void refresh_activity(Request *cr){
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *c = find_client(&cr->sender);
+    
+    remove_activity(&waiting_clients, c);
+    c->last_active_time = current_time();
+    c->waiting_ping = 0;
+    c->ping_sent_time = 0;
+    insert_activity(&active_clients, c);
+    pthread_rwlock_unlock(&clients_lock);
+}
+
+
+
 void connect_client(void *arg){
     char message[BUFFER_SIZE];
     Request *cr = (Request *) arg;
 
     pthread_rwlock_wrlock(&clients_lock);
     Client *c = calloc(1, sizeof(*c));
+    if (clients == NULL){
+        c->id = 0;
+    }
+    else{
+        c->id = clients->id + 1;
+    }
+    c->muted_clients = NULL;
     c->address = cr->sender;
     strcpy(c->name, cr->text);
+
+    c->last_active_time = current_time();
+    c->ping_sent_time = 0;
+    c->waiting_ping = 0;
+    c->activity_next = NULL;
+    insert_activity(&active_clients, c);
+
     c->next = clients;
     clients = c;
     pthread_rwlock_unlock(&clients_lock);
 
     snprintf(message, sizeof(message), "Hi %s, you have successfully connected to the chat\n", cr->text);
     reply_client(cr, "you have successfully connected to the chat");
+    reply_client(cr, "This is chat history.");
+
+    pthread_rwlock_rdlock(&history_lock);
+    if(history_count < HISTORY_SIZE){
+        for(int i; i<history_count; i++){
+            reply_client(cr,history[i]);
+        }
+    }
+    else{
+        int position = history_next;
+        for(int i=0; i< HISTORY_SIZE; i++){
+            reply_client(cr,history[position]);
+            position = (position + 1) % HISTORY_SIZE;
+        }
+    }
+    pthread_rwlock_unlock(&history_lock);
 }
 
 void say_client(void *arg){
@@ -75,8 +260,11 @@ void say_client(void *arg){
         Client *clients_list = clients;
         char message[BUFFER_SIZE];
         snprintf(message, sizeof(message), "%s: %s\n", c->name, cr->text);
+        add_history(message);
         while(clients_list != NULL){
-            udp_socket_write(cr->sd, &clients_list->address ,message, strlen(message) + 1);
+            if (check_if_muted(clients_list->muted_clients, c->id) != 1){
+                udp_socket_write(cr->sd, &clients_list->address ,message, strlen(message) + 1);
+            }
             clients_list = clients_list->next;
         }
     }
@@ -117,24 +305,7 @@ void disconn_client(void *arg){
         pthread_rwlock_unlock(&clients_lock);
         return;
     }
-    
-    Client *c_list = clients;
-    Client *previous = NULL;
-    while(c_list != NULL){
-        if(c_list == c){
-            if(previous == NULL){
-                clients = c_list->next;
-            }
-            else{
-                previous->next = c_list->next;
-            }
-
-            free(c_list);
-            break;
-        }
-        previous = c_list;
-        c_list = c_list->next;
-    }
+    remove_client(c);
     pthread_rwlock_unlock(&clients_lock);
 
     reply_client(cr, "Disconnected. Bye!");
@@ -156,19 +327,98 @@ void rename_client(void *arg){
 void mute_client(void *arg){
     Request *cr = (Request *) arg;
 
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *sender = find_client(&cr->sender);
+    Client *target = find_client_by_name(cr->text);
+    MutedClient *m = calloc(1, sizeof(*m));
+    m->id = target->id;
+    m->next = sender->muted_clients;
+    sender->muted_clients = m;
+    pthread_rwlock_unlock(&clients_lock);
+
 }
 
 void unmute_client(void *arg){
     Request *cr = (Request *) arg;
+
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *sender = find_client(&cr->sender);
+    Client *target = find_client_by_name(cr->text);
+    MutedClient *m = sender->muted_clients;
+    MutedClient *previous_m = NULL;
+
+    while(m != NULL){
+        if(m->id == target->id){
+            if (previous_m == NULL){
+                sender->muted_clients = m->next;
+            }
+            else{
+                previous_m->next = m->next;
+            }
+        }
+        previous_m = m;
+        m = m->next;
+    }
+    pthread_rwlock_unlock(&clients_lock);
 }
 
 void kick_client(void *arg){
     Request *cr = (Request *) arg;
+    if(ntohs(cr->sender.sin_port) != 6666){
+        reply_client(cr, "No Permission.");
+        return;
+    }
+
+    pthread_rwlock_wrlock(&clients_lock);
+    Client *target = find_client_by_name(cr->text);
+    Client *c_list = clients;
+    char message_to_target[BUFFER_SIZE], broadcast_message[BUFFER_SIZE];
+    snprintf(message_to_target, sizeof(message_to_target), "You have been removed from the chat.\n");
+    snprintf(broadcast_message, sizeof(broadcast_message), "%s has been removed from the chat.\n", target->name);
+
+    udp_socket_write(cr->sd, &target->address ,message_to_target, strlen(message_to_target) + 1);
+    remove_client(target);
+    
+    while(c_list != NULL){
+        udp_socket_write(cr->sd, &c_list->address ,broadcast_message, strlen(broadcast_message) + 1);
+        c_list = c_list->next;
+    }
+
+    pthread_rwlock_unlock(&clients_lock);
 }
 
 
 
+void *ping_thread(void *arg){
+    int sd = *(int *)arg;
 
+    while(1){
+        pthread_rwlock_wrlock(&clients_lock);
+
+        time_t now = current_time();
+        while(waiting_clients != NULL && now - waiting_clients->ping_sent_time >= PING_TIMEOUT){
+            Client *c = waiting_clients;
+            printf("%s has timed out.\n", c->name);
+            remove_client(c);
+        }
+
+        while(active_clients != NULL && now - active_clients->last_active_time >= INACTIVE_TIME){
+            Client *c = active_clients;
+
+            remove_activity(&active_clients, c);
+            c->waiting_ping = 1;
+            c->ping_sent_time = current_time();
+            insert_activity(&waiting_clients, c);
+
+            char message[] = "ping$";
+            udp_socket_write(sd, &c->address, message, sizeof(message));
+        }
+
+        pthread_rwlock_unlock(&clients_lock);
+        sleep(1);
+    }
+    return NULL;
+}
 
 void *worker_thread(void *arg){
     Request *cr = (Request *) arg;
@@ -223,6 +473,9 @@ void *worker_thread(void *arg){
         strcpy(cr->text, client_request);
         kick_client(cr);
     }
+    else{
+        reply_client(cr,"Unknown Command.");
+    }
 
 
     free(cr);
@@ -255,7 +508,15 @@ void *listener_thread(void *arg){
             continue;
         }
         client_requests->text[rc] = '\0';
-        // Successfully received an incoming request
+
+        client_requests->text[strcspn(client_requests->text, "\r\n")] = '\0';
+        if(client_requests->text == "ret-ping$"){
+            refresh_activity(client_requests);
+            free(client_requests);
+            continue;
+        }
+        record_activity(client_requests);
+
 
         pthread_t worker;
         rc = pthread_create(&worker, NULL, worker_thread, client_requests);
@@ -271,14 +532,18 @@ void *listener_thread(void *arg){
 
 
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]){
     int sd = udp_socket_open(SERVER_PORT);
     assert(sd > -1);
 
     pthread_t listener;
+    pthread_t ping;
+
     pthread_create(&listener, NULL, listener_thread, &sd);
+    pthread_create(&ping, NULL, ping_thread, &sd);
     pthread_join(listener, NULL);
+    pthread_join(ping,NULL);
+
     close(sd);
     return 0;
 }
